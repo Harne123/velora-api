@@ -119,9 +119,11 @@ db.prepare(`DELETE FROM accounts WHERE username IN ('alice','bob','cara')`).run(
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '40mb' }));
 
 const now = () => Date.now();
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ONLINE_STALE_MS = 90_000;
 
 function normalizePhone(input) {
   const digits = String(input || '').replace(/[^\d+]/g, '');
@@ -133,18 +135,29 @@ function normalizePhone(input) {
   return only.startsWith('+') ? only : `+${only}`;
 }
 
+function isHiddenUsername(u) {
+  return String(u || '').startsWith('__h_');
+}
+
+function effectivePresence(presence, lastSeen) {
+  if (presence === 'online' && lastSeen && now() - Number(lastSeen) > ONLINE_STALE_MS) return 'offline';
+  return presence;
+}
+
 function mapAccount(row) {
+  const username = isHiddenUsername(row.username) ? '' : row.username;
   return {
     id: row.id,
-    username: row.username,
+    username,
     displayName: row.display_name,
     phone: row.phone,
     avatarPath: row.avatar_url || null,
     bio: row.bio,
     statusText: row.status_text,
-    presence: row.presence,
+    presence: effectivePresence(row.presence, row.last_seen),
     lastSeen: row.last_seen,
     profileComplete: !!row.profile_complete,
+    createdAt: row.created_at,
   };
 }
 
@@ -230,7 +243,7 @@ function ensureSaved(accountId) {
   ).run(uuid(), chatId, accountId);
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.2.0' }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.2.1' }));
 
 app.post('/auth/request-code', async (req, res) => {
   try {
@@ -340,23 +353,40 @@ app.get('/me', auth, (req, res) => res.json(mapAccount(req.account)));
 app.patch('/me', auth, (req, res) => {
   try {
     const patch = req.body || {};
+    const within24h = now() - Number(req.account.created_at) < DAY_MS;
     let username = req.account.username;
-    if (patch.username) {
-      username = String(patch.username).trim().replace(/^@/, '').toLowerCase();
-      if (!/^[a-z0-9_]{3,32}$/.test(username)) return res.status(400).json({ error: 'Неверный username' });
-      const clash = db.prepare(`SELECT id FROM accounts WHERE username = ? AND id != ?`).get(username, req.account.id);
-      if (clash) return res.status(400).json({ error: 'Username уже занят' });
+    let displayName = patch.displayName !== undefined ? String(patch.displayName).trim() : req.account.display_name;
+
+    if (patch.username !== undefined) {
+      const raw = String(patch.username).trim().replace(/^@/, '').toLowerCase();
+      if (!raw) {
+        if (within24h) return res.status(400).json({ error: 'Первые 24 часа username обязателен' });
+        username = `__h_${req.account.id.replace(/-/g, '').slice(0, 16)}`;
+      } else {
+        if (!/^[a-z0-9_]{3,32}$/.test(raw)) return res.status(400).json({ error: 'Неверный username' });
+        const clash = db.prepare(`SELECT id FROM accounts WHERE username = ? AND id != ?`).get(raw, req.account.id);
+        if (clash) return res.status(400).json({ error: 'Username уже занят' });
+        username = raw;
+      }
     }
+
+    if (patch.displayName !== undefined) {
+      if (!displayName) {
+        if (within24h) return res.status(400).json({ error: 'Первые 24 часа имя обязательно' });
+        displayName = '';
+      }
+    }
+
+    // presence меняется только через /presence (автоматика клиента)
     db.prepare(
-      `UPDATE accounts SET username = ?, display_name = ?, bio = ?, status_text = ?, avatar_url = ?, presence = ?,
+      `UPDATE accounts SET username = ?, display_name = ?, bio = ?, status_text = ?, avatar_url = ?,
        profile_complete = ?, updated_at = ?, last_seen = ? WHERE id = ?`
     ).run(
       username,
-      patch.displayName ?? req.account.display_name,
+      displayName,
       patch.bio ?? req.account.bio,
       patch.statusText ?? req.account.status_text,
       patch.avatarPath !== undefined ? patch.avatarPath : req.account.avatar_url,
-      patch.presence ?? req.account.presence,
       patch.profileComplete === false ? 0 : patch.profileComplete === true ? 1 : req.account.profile_complete,
       now(),
       now(),
@@ -369,15 +399,44 @@ app.patch('/me', auth, (req, res) => {
   }
 });
 
+app.post('/presence', auth, (req, res) => {
+  try {
+    const status = String(req.body?.status || 'online');
+    if (!['online', 'away', 'offline'].includes(status)) {
+      return res.status(400).json({ error: 'Неверный статус' });
+    }
+    const t = now();
+    db.prepare(`UPDATE accounts SET presence = ?, last_seen = ?, updated_at = ? WHERE id = ?`).run(
+      status,
+      t,
+      t,
+      req.account.id
+    );
+    res.json({ ok: true, presence: status, lastSeen: t });
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.get('/accounts/:id', auth, (req, res) => {
+  const row = db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Не найден' });
+  res.json(mapAccount(row));
+});
+
 app.get('/search/username/:username', auth, (req, res) => {
   const username = String(req.params.username || '').replace(/^@/, '').trim().toLowerCase();
-  if (!username) return res.json({ users: [] });
+  if (!username || username.startsWith('__h_')) return res.json({ users: [], channels: [], chats: [], messages: [] });
   const rows = db
     .prepare(
-      `SELECT id, username, display_name as displayName, avatar_url as avatarPath, presence, status_text as statusText
-       FROM accounts WHERE username = ? COLLATE NOCASE AND id != ? LIMIT 1`
+      `SELECT id, username, display_name as displayName, avatar_url as avatarPath, presence, last_seen as lastSeen, status_text as statusText
+       FROM accounts WHERE username = ? COLLATE NOCASE AND id != ? AND username NOT LIKE '__h_%' LIMIT 1`
     )
-    .all(username, req.account.id);
+    .all(username, req.account.id)
+    .map((r) => ({
+      ...r,
+      presence: effectivePresence(r.presence, r.lastSeen),
+    }));
   res.json({ users: rows, channels: [], chats: [], messages: [] });
 });
 
@@ -401,6 +460,7 @@ app.get('/chats', auth, (req, res) => {
     let username = row.username;
     let avatarPath = row.avatar_url;
     let peerPresence = null;
+    let peerLastSeen = null;
     let peerId = null;
     if (row.type === 'private') {
       const peer = db
@@ -410,10 +470,11 @@ app.get('/chats', auth, (req, res) => {
         )
         .get(row.id, req.account.id);
       if (peer) {
-        title = peer.display_name;
-        username = peer.username;
+        title = peer.display_name || 'Без имени';
+        username = isHiddenUsername(peer.username) ? null : peer.username;
         avatarPath = peer.avatar_url;
-        peerPresence = peer.presence;
+        peerPresence = effectivePresence(peer.presence, peer.last_seen);
+        peerLastSeen = peer.last_seen;
         peerId = peer.id;
       }
     }
@@ -436,6 +497,7 @@ app.get('/chats', auth, (req, res) => {
       lastMessage: row.last_message,
       lastMessageType: row.last_message_type,
       peerPresence,
+      peerLastSeen: peerLastSeen ?? null,
       peerId,
     };
   });
