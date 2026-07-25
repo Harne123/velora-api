@@ -243,7 +243,7 @@ function ensureSaved(accountId) {
   ).run(uuid(), chatId, accountId);
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.2.1' }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.2.2' }));
 
 app.post('/auth/request-code', async (req, res) => {
   try {
