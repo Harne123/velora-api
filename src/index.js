@@ -142,9 +142,42 @@ CREATE TABLE IF NOT EXISTS call_signals (
   payload TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS message_hides (
+  id TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(message_id, account_id)
+);
+CREATE TABLE IF NOT EXISTS contact_nicknames (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  peer_id TEXT NOT NULL,
+  nickname TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(owner_id, peer_id)
+);
 `);
 
-// wipe legacy demo accounts if somehow present
+try {
+  db.exec(`ALTER TABLE accounts ADD COLUMN hide_phone INTEGER NOT NULL DEFAULT 0`);
+} catch { /* exists */ }
+try {
+  db.exec(`ALTER TABLE accounts ADD COLUMN hide_avatar INTEGER NOT NULL DEFAULT 0`);
+} catch { /* exists */ }
+try {
+  db.exec(`ALTER TABLE chat_prefs ADD COLUMN nickname TEXT`);
+} catch { /* exists */ }
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN forwarded_from_id TEXT`);
+} catch { /* exists */ }
+
+const DEV_USERNAMES = new Set(
+  String(process.env.DEV_USERNAMES || 'harne123')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
 db.prepare(`DELETE FROM accounts WHERE username IN ('alice','bob','cara')`).run();
 
 const app = express();
@@ -174,21 +207,35 @@ function effectivePresence(presence, lastSeen) {
   return presence;
 }
 
-function mapAccount(row) {
+function mapAccount(row, viewerId = null) {
   const username = isHiddenUsername(row.username) ? '' : row.username;
+  const blocked = viewerId ? isBlockedEither(viewerId, row.id) : false;
+  const hidePhone = !!row.hide_phone;
+  const hideAvatar = !!row.hide_avatar || blocked;
   return {
     id: row.id,
     username,
-    displayName: row.display_name,
-    phone: row.phone,
-    avatarPath: row.avatar_url || null,
-    bio: row.bio,
-    statusText: row.status_text,
-    presence: effectivePresence(row.presence, row.last_seen),
-    lastSeen: row.last_seen,
+    displayName: blocked ? 'Пользователь' : row.display_name,
+    phone: hidePhone && viewerId && viewerId !== row.id ? null : row.phone,
+    avatarPath: hideAvatar ? null : row.avatar_url || null,
+    bio: blocked ? '' : row.bio,
+    statusText: blocked ? '' : row.status_text,
+    presence: blocked ? 'offline' : effectivePresence(row.presence, row.last_seen),
+    lastSeen: blocked ? 1 : row.last_seen,
     profileComplete: !!row.profile_complete,
     createdAt: row.created_at,
+    isDeveloper: DEV_USERNAMES.has(String(row.username || '').toLowerCase()),
+    hidePhone: !!row.hide_phone,
+    hideAvatar: !!row.hide_avatar,
   };
+}
+
+function isBlockedEither(a, b) {
+  return !!db
+    .prepare(
+      `SELECT id FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1`
+    )
+    .get(a, b, b, a);
 }
 
 function auth(req, res, next) {
@@ -273,7 +320,7 @@ function ensureSaved(accountId) {
   ).run(uuid(), chatId, accountId);
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.3.0' }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.4.0' }));
 
 app.post('/auth/request-code', async (req, res) => {
   try {
@@ -378,7 +425,7 @@ app.post('/auth/logout', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/me', auth, (req, res) => res.json(mapAccount(req.account)));
+app.get('/me', auth, (req, res) => res.json(mapAccount(req.account, req.account.id)));
 
 app.patch('/me', auth, (req, res) => {
   try {
@@ -416,10 +463,15 @@ app.patch('/me', auth, (req, res) => {
       passwordHash = bcrypt.hashSync(pwd, 10);
     }
 
+    const hidePhone =
+      patch.hidePhone !== undefined ? (patch.hidePhone ? 1 : 0) : req.account.hide_phone || 0;
+    const hideAvatar =
+      patch.hideAvatar !== undefined ? (patch.hideAvatar ? 1 : 0) : req.account.hide_avatar || 0;
+
     // presence меняется только через /presence (автоматика клиента)
     db.prepare(
       `UPDATE accounts SET username = ?, display_name = ?, bio = ?, status_text = ?, avatar_url = ?,
-       password_hash = ?, profile_complete = ?, updated_at = ?, last_seen = ? WHERE id = ?`
+       password_hash = ?, profile_complete = ?, hide_phone = ?, hide_avatar = ?, updated_at = ?, last_seen = ? WHERE id = ?`
     ).run(
       username,
       displayName,
@@ -428,12 +480,14 @@ app.patch('/me', auth, (req, res) => {
       patch.avatarPath !== undefined ? patch.avatarPath : req.account.avatar_url,
       passwordHash,
       patch.profileComplete === false ? 0 : patch.profileComplete === true ? 1 : req.account.profile_complete,
+      hidePhone,
+      hideAvatar,
       now(),
       now(),
       req.account.id
     );
     const updated = db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(req.account.id);
-    res.json(mapAccount(updated));
+    res.json(mapAccount(updated, req.account.id));
   } catch (err) {
     res.status(500).json({ error: err.message || String(err) });
   }
@@ -483,7 +537,37 @@ app.post('/presence', auth, (req, res) => {
 app.get('/accounts/:id', auth, (req, res) => {
   const row = db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Не найден' });
-  res.json(mapAccount(row));
+  const mapped = mapAccount(row, req.account.id);
+  const nick = db
+    .prepare(`SELECT nickname FROM contact_nicknames WHERE owner_id = ? AND peer_id = ?`)
+    .get(req.account.id, row.id);
+  if (nick?.nickname) mapped.displayName = nick.nickname;
+  mapped.isBlocked = isBlockedEither(req.account.id, row.id);
+  mapped.iBlocked = !!db
+    .prepare(`SELECT id FROM blocks WHERE blocker_id = ? AND blocked_id = ?`)
+    .get(req.account.id, row.id);
+  res.json(mapped);
+});
+
+app.put('/contacts/:peerId/nickname', auth, (req, res) => {
+  const peerId = req.params.peerId;
+  const nickname = String(req.body?.nickname || '').trim();
+  if (!peerId) return res.status(400).json({ error: 'Нужен peerId' });
+  if (!nickname) {
+    db.prepare(`DELETE FROM contact_nicknames WHERE owner_id = ? AND peer_id = ?`).run(req.account.id, peerId);
+    return res.json({ ok: true, nickname: null });
+  }
+  const existing = db
+    .prepare(`SELECT id FROM contact_nicknames WHERE owner_id = ? AND peer_id = ?`)
+    .get(req.account.id, peerId);
+  if (existing) {
+    db.prepare(`UPDATE contact_nicknames SET nickname = ? WHERE id = ?`).run(nickname, existing.id);
+  } else {
+    db.prepare(
+      `INSERT INTO contact_nicknames (id, owner_id, peer_id, nickname, created_at) VALUES (?, ?, ?, ?, ?)`
+    ).run(uuid(), req.account.id, peerId, nickname, now());
+  }
+  res.json({ ok: true, nickname });
 });
 
 app.get('/search/username/:username', auth, (req, res) => {
@@ -505,10 +589,10 @@ app.get('/search/username/:username', auth, (req, res) => {
        LIMIT 20`
     )
     .all(req.account.id, username, like, username)
-    .map((r) => ({
-      ...r,
-      presence: effectivePresence(r.presence, r.lastSeen),
-    }));
+    .map((r) => {
+      const full = db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(r.id);
+      return mapAccount(full, req.account.id);
+    });
   res.json({ users: rows, channels: [], chats: [], messages: [] });
 });
 
@@ -534,6 +618,7 @@ app.get('/chats', auth, (req, res) => {
     let peerPresence = null;
     let peerLastSeen = null;
     let peerId = null;
+    let isDeveloper = false;
     if (row.type === 'private') {
       const peer = db
         .prepare(
@@ -542,12 +627,17 @@ app.get('/chats', auth, (req, res) => {
         )
         .get(row.id, req.account.id);
       if (peer) {
-        title = peer.display_name || 'Без имени';
-        username = isHiddenUsername(peer.username) ? null : peer.username;
-        avatarPath = peer.avatar_url;
-        peerPresence = effectivePresence(peer.presence, peer.last_seen);
-        peerLastSeen = peer.last_seen;
+        const mappedPeer = mapAccount(peer, req.account.id);
+        const nick = db
+          .prepare(`SELECT nickname FROM contact_nicknames WHERE owner_id = ? AND peer_id = ?`)
+          .get(req.account.id, peer.id);
+        title = nick?.nickname || mappedPeer.displayName || 'Без имени';
+        username = mappedPeer.username || null;
+        avatarPath = mappedPeer.avatarPath;
+        peerPresence = mappedPeer.presence;
+        peerLastSeen = mappedPeer.lastSeen;
         peerId = peer.id;
+        isDeveloper = !!mappedPeer.isDeveloper;
       }
     }
     return {
@@ -571,6 +661,7 @@ app.get('/chats', auth, (req, res) => {
       peerPresence,
       peerLastSeen: peerLastSeen ?? null,
       peerId,
+      isDeveloper,
     };
   });
   res.json(mapped);
@@ -635,22 +726,48 @@ app.post('/chats', auth, (req, res) => {
   const title = String(req.body.title || '').trim();
   if (!title) return res.status(400).json({ error: 'Название обязательно' });
   const username = req.body.username ? String(req.body.username).replace(/^@/, '').toLowerCase() : null;
+  const avatarUrl = req.body.avatarPath || null;
+  const memberIds = Array.isArray(req.body.memberIds) ? req.body.memberIds.map(String) : [];
   const t = now();
   const chatId = uuid();
   db.prepare(
     `INSERT INTO chats (id, type, title, username, avatar_url, description, owner_id, created_at, updated_at, last_message_at)
-     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
-  ).run(chatId, type, title, username, req.body.description || '', req.account.id, t, t, t);
-  db.prepare(`INSERT INTO chat_members (id, chat_id, account_id, role, joined_at) VALUES (?, ?, ?, 'owner', ?)`).run(
-    uuid(),
-    chatId,
-    req.account.id,
-    t
-  );
-  db.prepare(
-    `INSERT INTO chat_prefs (id, chat_id, account_id, is_pinned, is_archived, is_muted, unread_count) VALUES (?, ?, ?, 0, 0, 0, 0)`
-  ).run(uuid(), chatId, req.account.id);
-  res.json({ id: chatId, type, title, username });
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(chatId, type, title, username, avatarUrl, req.body.description || '', req.account.id, t, t, t);
+  const members = new Set([req.account.id, ...memberIds.filter((id) => id && id !== req.account.id)]);
+  for (const uid of members) {
+    if (uid !== req.account.id && isBlockedEither(req.account.id, uid)) continue;
+    const role = uid === req.account.id ? 'owner' : 'member';
+    try {
+      db.prepare(`INSERT INTO chat_members (id, chat_id, account_id, role, joined_at) VALUES (?, ?, ?, ?, ?)`).run(
+        uuid(),
+        chatId,
+        uid,
+        role,
+        t
+      );
+      db.prepare(
+        'INSERT INTO chat_prefs (id, chat_id, account_id, is_pinned, is_archived, is_muted, unread_count) VALUES (?, ?, ?, 0, 0, 0, 0)'
+      ).run(uuid(), chatId, uid);
+    } catch {
+      /* skip */
+    }
+  }
+  res.json({
+    id: chatId,
+    type,
+    title,
+    username,
+    avatarPath: avatarUrl,
+    unreadCount: 0,
+    lastMessageAt: t,
+    isPinned: 0,
+    isArchived: 0,
+    isMuted: 0,
+    folderId: null,
+    createdAt: t,
+    updatedAt: t,
+  });
 });
 
 app.post('/chats/:id/read', auth, (req, res) => {
@@ -723,16 +840,8 @@ app.get('/blocks', auth, (req, res) => {
        FROM blocks b INNER JOIN accounts a ON a.id = b.blocked_id WHERE b.blocker_id = ?`
     )
     .all(req.account.id);
-  res.json(rows);
+  res.json(rows.map((r) => ({ ...r, avatarPath: null, displayName: r.displayName || 'Пользователь' })));
 });
-
-function isBlockedEither(a, b) {
-  return !!db
-    .prepare(
-      `SELECT id FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1`
-    )
-    .get(a, b, b, a);
-}
 
 app.get('/chats/:id/messages', auth, (req, res) => {
   const member = db
@@ -741,13 +850,19 @@ app.get('/chats/:id/messages', auth, (req, res) => {
   if (!member) return res.status(403).json({ error: 'Access denied' });
   const rows = db
     .prepare(
-      `SELECT * FROM messages WHERE chat_id = ? AND is_deleted = 0 ORDER BY created_at DESC LIMIT ?`
+      `SELECT m.* FROM messages m
+       WHERE m.chat_id = ? AND m.is_deleted = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM message_hides h WHERE h.message_id = m.id AND h.account_id = ?
+         )
+       ORDER BY m.created_at DESC LIMIT ?`
     )
-    .all(req.params.id, Number(req.query.limit || 100))
+    .all(req.params.id, req.account.id, Number(req.query.limit || 100))
     .reverse();
 
   const mapped = rows.map((row) => {
-    const sender = db.prepare(`SELECT display_name, avatar_url FROM accounts WHERE id = ?`).get(row.sender_id);
+    const sender = db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(row.sender_id);
+    const mappedSender = sender ? mapAccount(sender, req.account.id) : null;
     const reactionsRaw = db
       .prepare(
         `SELECT emoji, COUNT(*) as count, SUM(CASE WHEN account_id = ? THEN 1 ELSE 0 END) as reacted
@@ -764,6 +879,11 @@ app.get('/chats/:id/messages', auth, (req, res) => {
         .get(row.reply_to_id);
       if (reply) replyPreview = reply;
     }
+    let forwardedFromName = null;
+    if (row.forwarded_from_id) {
+      const fwd = db.prepare(`SELECT display_name FROM accounts WHERE id = ?`).get(row.forwarded_from_id);
+      forwardedFromName = fwd?.display_name || 'Пользователь';
+    }
     return {
       id: row.id,
       chatId: row.chat_id,
@@ -771,6 +891,8 @@ app.get('/chats/:id/messages', auth, (req, res) => {
       type: row.type,
       content: row.content,
       replyToId: row.reply_to_id,
+      forwardedFromId: row.forwarded_from_id || null,
+      forwardedFromName,
       mediaPath: row.media_url,
       mediaName: row.media_name,
       mediaSize: row.media_size,
@@ -779,8 +901,8 @@ app.get('/chats/:id/messages', auth, (req, res) => {
       isDeleted: row.is_deleted,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      senderName: sender?.display_name,
-      senderAvatar: sender?.avatar_url || null,
+      senderName: mappedSender?.displayName,
+      senderAvatar: mappedSender?.avatarPath || null,
       reactions: reactionsRaw.map((r) => ({ emoji: r.emoji, count: r.count, reacted: !!r.reacted })),
       replyPreview,
     };
@@ -807,9 +929,10 @@ app.post('/chats/:id/messages', auth, (req, res) => {
   if (type === 'text' && !content && !req.body.mediaPath) return res.status(400).json({ error: 'Пустое сообщение' });
   const t = now();
   const id = uuid();
+  const forwardedFromId = req.body.forwardedFromId || null;
   db.prepare(
-    `INSERT INTO messages (id, chat_id, sender_id, type, content, reply_to_id, media_url, media_name, media_size, media_duration, is_edited, is_deleted, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
+    `INSERT INTO messages (id, chat_id, sender_id, type, content, reply_to_id, forwarded_from_id, media_url, media_name, media_size, media_duration, is_edited, is_deleted, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
   ).run(
     id,
     req.params.id,
@@ -817,6 +940,7 @@ app.post('/chats/:id/messages', auth, (req, res) => {
     type,
     content,
     req.body.replyToId || null,
+    forwardedFromId,
     req.body.mediaPath || null,
     req.body.mediaName || null,
     req.body.mediaSize ?? null,
@@ -829,6 +953,11 @@ app.post('/chats/:id/messages', auth, (req, res) => {
     req.params.id,
     req.account.id
   );
+  let forwardedFromName = null;
+  if (forwardedFromId) {
+    const fwd = db.prepare(`SELECT display_name FROM accounts WHERE id = ?`).get(forwardedFromId);
+    forwardedFromName = fwd?.display_name || 'Пользователь';
+  }
   const message = {
     id,
     chatId: req.params.id,
@@ -836,6 +965,8 @@ app.post('/chats/:id/messages', auth, (req, res) => {
     type,
     content,
     replyToId: req.body.replyToId || null,
+    forwardedFromId,
+    forwardedFromName,
     mediaPath: req.body.mediaPath || null,
     mediaName: req.body.mediaName || null,
     mediaSize: req.body.mediaSize ?? null,
@@ -874,12 +1005,84 @@ app.post('/messages/:id/react', auth, (req, res) => {
 app.delete('/messages/:id', auth, (req, res) => {
   const msg = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(req.params.id);
   if (!msg) return res.status(404).json({ error: 'Not found' });
-  if (msg.sender_id !== req.account.id) return res.status(403).json({ error: 'Forbidden' });
-  db.prepare(`UPDATE messages SET is_deleted = 1, content = '', media_url = NULL, updated_at = ? WHERE id = ?`).run(
-    now(),
-    req.params.id
-  );
+  const forEveryone = String(req.query.scope || req.body?.scope || '') === 'everyone';
+  if (forEveryone) {
+    if (msg.sender_id !== req.account.id) return res.status(403).json({ error: 'Forbidden' });
+    db.prepare(`UPDATE messages SET is_deleted = 1, content = '', media_url = NULL, updated_at = ? WHERE id = ?`).run(
+      now(),
+      req.params.id
+    );
+  } else {
+    try {
+      db.prepare(`INSERT INTO message_hides (id, message_id, account_id, created_at) VALUES (?, ?, ?, ?)`).run(
+        uuid(),
+        req.params.id,
+        req.account.id,
+        now()
+      );
+    } catch {
+      /* already hidden */
+    }
+  }
   res.json({ ok: true });
+});
+
+app.post('/messages/:id/forward', auth, (req, res) => {
+  const msg = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(req.params.id);
+  if (!msg || msg.is_deleted) return res.status(404).json({ error: 'Not found' });
+  const targetChatId = String(req.body?.targetChatId || '');
+  const member = db
+    .prepare(`SELECT id FROM chat_members WHERE chat_id = ? AND account_id = ?`)
+    .get(targetChatId, req.account.id);
+  if (!member) return res.status(403).json({ error: 'Access denied' });
+  const t = now();
+  const id = uuid();
+  const fromId = msg.forwarded_from_id || msg.sender_id;
+  db.prepare(
+    `INSERT INTO messages (id, chat_id, sender_id, type, content, reply_to_id, forwarded_from_id, media_url, media_name, media_size, media_duration, is_edited, is_deleted, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
+  ).run(
+    id,
+    targetChatId,
+    req.account.id,
+    msg.type,
+    msg.content,
+    fromId,
+    msg.media_url,
+    msg.media_name,
+    msg.media_size,
+    msg.media_duration,
+    t,
+    t
+  );
+  db.prepare(`UPDATE chats SET last_message_at = ?, updated_at = ? WHERE id = ?`).run(t, t, targetChatId);
+  db.prepare(`UPDATE chat_prefs SET unread_count = unread_count + 1 WHERE chat_id = ? AND account_id != ?`).run(
+    targetChatId,
+    req.account.id
+  );
+  const fwd = db.prepare(`SELECT display_name FROM accounts WHERE id = ?`).get(fromId);
+  res.json({
+    id,
+    chatId: targetChatId,
+    senderId: req.account.id,
+    type: msg.type,
+    content: msg.content,
+    replyToId: null,
+    forwardedFromId: fromId,
+    forwardedFromName: fwd?.display_name || 'Пользователь',
+    mediaPath: msg.media_url,
+    mediaName: msg.media_name,
+    mediaSize: msg.media_size,
+    mediaDuration: msg.media_duration,
+    isEdited: 0,
+    isDeleted: 0,
+    createdAt: t,
+    updatedAt: t,
+    senderName: req.account.display_name,
+    senderAvatar: req.account.avatar_url,
+    reactions: [],
+    replyPreview: null,
+  });
 });
 
 app.patch('/messages/:id', auth, (req, res) => {
