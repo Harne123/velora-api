@@ -328,7 +328,7 @@ app.get('/health', (_req, res) =>
   res.json({
     ok: true,
     service: 'velora-online',
-    version: '1.4.1',
+    version: '1.5.0',
     dataDir,
     durableHint: dataDir.startsWith('/var/data') || !!process.env.DATA_DIR,
   })
