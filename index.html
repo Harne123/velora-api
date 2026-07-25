@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Velora — скачать мессенджер</title>
+    <meta name="description" content="Velora — современный desktop-мессенджер. Скачайте для Windows и получайте обновления автоматически." />
+    <link rel="icon" href="./favicon.ico" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./assets/styles.css" />
+  </head>
+  <body>
+    <div class="bg-mesh" aria-hidden="true"></div>
+    <div class="bg-grid" aria-hidden="true"></div>
+    <div class="aurora" aria-hidden="true">
+      <span></span><span></span><span></span>
+    </div>
+    <div class="bg-glow glow-a" aria-hidden="true"></div>
+    <div class="bg-glow glow-b" aria-hidden="true"></div>
+    <div class="bg-glow glow-c" aria-hidden="true"></div>
+    <div class="stars" aria-hidden="true"></div>
+    <div class="bg-noise" aria-hidden="true"></div>
+    <div class="orb orb-1" aria-hidden="true"></div>
+    <div class="orb orb-2" aria-hidden="true"></div>
+
+    <header class="nav">
+      <a class="brand" href="#">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Velora</span>
+      </a>
+      <nav class="nav-links">
+        <a href="#features">Возможности</a>
+        <a href="#updates">Обновления</a>
+        <a class="nav-cta" href="#download">Скачать</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" id="download">
+        <div class="hero-copy">
+          <p class="eyebrow reveal"><span class="pulse-dot"></span> Desktop messenger</p>
+          <h1 class="reveal delay-1">
+            <span class="brand-gradient title-glow">Velora</span>
+          </h1>
+          <p class="lead reveal delay-2">
+            Чаты, медиа и автообновления — в одном окне. Найди друзей по @username.
+          </p>
+          <div class="cta-row reveal delay-3">
+            <a class="btn-primary" id="downloadBtn" href="#">
+              <span class="btn-shine" aria-hidden="true"></span>
+              Скачать для Windows
+            </a>
+            <a class="btn-ghost" id="portableBtn" href="#">Portable EXE</a>
+          </div>
+          <p class="meta reveal delay-4">
+            <span id="versionLabel">v—</span>
+            · Windows x64
+            · Обновляется сама
+          </p>
+        </div>
+        <div class="hero-visual reveal delay-2" aria-hidden="true">
+          <div class="phone-frame">
+            <div class="phone-top">
+              <span class="dot"></span>
+              <span class="title">Velora</span>
+              <span class="live">online</span>
+            </div>
+            <div class="chat-preview">
+              <div class="bubble left float-a">Привет ✨</div>
+              <div class="bubble right float-b">Скачал Velora</div>
+              <div class="bubble left float-c">Обновляется сама</div>
+              <div class="typing">
+                <span></span><span></span><span></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="features">
+        <h2 class="section-title reveal">
+          <span class="title-line">Всё нужное</span>
+          <span class="title-accent">уже внутри</span>
+        </h2>
+        <p class="section-sub reveal">Один аккаунт на номер. Быстрый интерфейс. Друзья находятся по @username.</p>
+        <div class="feature-grid">
+          <article class="feature-card reveal">
+            <div class="feature-icon">💬</div>
+            <h3>Чаты</h3>
+            <p>Личные сообщения, группы, каналы и поиск по username.</p>
+          </article>
+          <article class="feature-card reveal delay-1">
+            <div class="feature-icon">📸</div>
+            <h3>Медиа</h3>
+            <p>Фото, GIF, стикеры и голосовые — сразу в переписке.</p>
+          </article>
+          <article class="feature-card reveal delay-2">
+            <div class="feature-icon">⚡</div>
+            <h3>Автообновление</h3>
+            <p>Новая версия скачивается сама — просто перезапусти приложение.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section updates" id="updates">
+        <div class="updates-card reveal">
+          <h2>Всегда свежая версия</h2>
+          <p>
+            Установите Velora один раз. Когда выходит обновление, приложение само скачивает его при запуске.
+          </p>
+          <div class="steps">
+            <div class="step"><span>1</span>Скачайте установщик</div>
+            <div class="step"><span>2</span>Установите как обычную программу</div>
+            <div class="step"><span>3</span>Обновления приходят автоматически</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="brand">
+        <span class="brand-mark sm" aria-hidden="true"></span>
+        <span>Velora</span>
+      </div>
+      <p>© <span id="year"></span> Velora. Windows x64.</p>
+    </footer>
+
+    <script src="./assets/config.js?v=1.3.1"></script>
+    <script src="./assets/main.js?v=1.3.1"></script>
+  </body>
+</html>
