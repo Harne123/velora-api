@@ -114,6 +114,36 @@ CREATE TABLE IF NOT EXISTS reactions (
 );
 `);
 
+db.exec(`
+CREATE TABLE IF NOT EXISTS blocks (
+  id TEXT PRIMARY KEY,
+  blocker_id TEXT NOT NULL,
+  blocked_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(blocker_id, blocked_id)
+);
+CREATE TABLE IF NOT EXISTS calls (
+  id TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL,
+  caller_id TEXT NOT NULL,
+  callee_id TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'audio',
+  status TEXT NOT NULL DEFAULT 'ringing',
+  offer_sdp TEXT,
+  answer_sdp TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS call_signals (
+  id TEXT PRIMARY KEY,
+  call_id TEXT NOT NULL,
+  from_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`);
+
 // wipe legacy demo accounts if somehow present
 db.prepare(`DELETE FROM accounts WHERE username IN ('alice','bob','cara')`).run();
 
@@ -243,7 +273,7 @@ function ensureSaved(accountId) {
   ).run(uuid(), chatId, accountId);
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.2.2' }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.3.0' }));
 
 app.post('/auth/request-code', async (req, res) => {
   try {
@@ -377,16 +407,26 @@ app.patch('/me', auth, (req, res) => {
       }
     }
 
+    let passwordHash = req.account.password_hash;
+    if (patch.password !== undefined) {
+      const pwd = String(patch.password);
+      if (pwd.length < 6 || !/[A-ZА-Я]/.test(pwd)) {
+        return res.status(400).json({ error: 'Пароль: минимум 6 символов и хотя бы одна заглавная буква' });
+      }
+      passwordHash = bcrypt.hashSync(pwd, 10);
+    }
+
     // presence меняется только через /presence (автоматика клиента)
     db.prepare(
       `UPDATE accounts SET username = ?, display_name = ?, bio = ?, status_text = ?, avatar_url = ?,
-       profile_complete = ?, updated_at = ?, last_seen = ? WHERE id = ?`
+       password_hash = ?, profile_complete = ?, updated_at = ?, last_seen = ? WHERE id = ?`
     ).run(
       username,
       displayName,
       patch.bio ?? req.account.bio,
       patch.statusText ?? req.account.status_text,
       patch.avatarPath !== undefined ? patch.avatarPath : req.account.avatar_url,
+      passwordHash,
       patch.profileComplete === false ? 0 : patch.profileComplete === true ? 1 : req.account.profile_complete,
       now(),
       now(),
@@ -394,6 +434,28 @@ app.patch('/me', auth, (req, res) => {
     );
     const updated = db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(req.account.id);
     res.json(mapAccount(updated));
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.post('/auth/login-password', (req, res) => {
+  try {
+    const phone = normalizePhone(req.body.phone);
+    const password = String(req.body.password || '');
+    const account = db.prepare(`SELECT * FROM accounts WHERE phone = ?`).get(phone);
+    if (!account) return res.status(400).json({ error: 'Аккаунт с этим номером не найден' });
+    if (!account.profile_complete) return res.status(400).json({ error: 'Сначала завершите регистрацию по SMS' });
+    if (!bcrypt.compareSync(password, account.password_hash)) {
+      return res.status(400).json({ error: 'Неверный пароль' });
+    }
+    const t = now();
+    db.prepare(`UPDATE accounts SET presence = 'online', last_seen = ?, updated_at = ? WHERE id = ?`).run(t, t, account.id);
+    const token = uuid();
+    db.prepare(
+      'INSERT INTO sessions (id, account_id, token, is_active, created_at, last_active) VALUES (?, ?, ?, 1, ?, ?)'
+    ).run(uuid(), account.id, token, t, t);
+    res.json({ account: mapAccount(account), token, isNew: false });
   } catch (err) {
     res.status(500).json({ error: err.message || String(err) });
   }
@@ -426,13 +488,23 @@ app.get('/accounts/:id', auth, (req, res) => {
 
 app.get('/search/username/:username', auth, (req, res) => {
   const username = String(req.params.username || '').replace(/^@/, '').trim().toLowerCase();
-  if (!username || username.startsWith('__h_')) return res.json({ users: [], channels: [], chats: [], messages: [] });
+  if (!username || username.length < 2 || username.startsWith('__h_')) {
+    return res.json({ users: [], channels: [], chats: [], messages: [] });
+  }
+  const like = `${username}%`;
   const rows = db
     .prepare(
       `SELECT id, username, display_name as displayName, avatar_url as avatarPath, presence, last_seen as lastSeen, status_text as statusText
-       FROM accounts WHERE username = ? COLLATE NOCASE AND id != ? AND username NOT LIKE '__h_%' LIMIT 1`
+       FROM accounts
+       WHERE id != ?
+         AND username NOT LIKE '__h_%'
+         AND (
+           lower(username) = ? OR lower(username) LIKE ?
+         )
+       ORDER BY CASE WHEN lower(username) = ? THEN 0 ELSE 1 END, username
+       LIMIT 20`
     )
-    .all(username, req.account.id)
+    .all(req.account.id, username, like, username)
     .map((r) => ({
       ...r,
       presence: effectivePresence(r.presence, r.lastSeen),
@@ -507,6 +579,7 @@ app.get('/chats', auth, (req, res) => {
 app.post('/chats/private', auth, (req, res) => {
   const peerId = req.body.peerId;
   if (!peerId || peerId === req.account.id) return res.status(400).json({ error: 'Неверный пользователь' });
+  if (isBlockedEither(req.account.id, peerId)) return res.status(403).json({ error: 'Пользователь в чёрном списке' });
   const peer = db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(peerId);
   if (!peer) return res.status(404).json({ error: 'Пользователь не найден' });
 
@@ -591,10 +664,17 @@ app.patch('/chats/:id/prefs', auth, (req, res) => {
     .get(req.params.id, req.account.id);
   if (!cur) return res.status(404).json({ error: 'Chat not found' });
   const p = req.body || {};
+  let nextPinned = p.isPinned !== undefined ? (p.isPinned ? 1 : 0) : cur.is_pinned;
+  if (nextPinned === 1 && !cur.is_pinned) {
+    const pinnedCount = db
+      .prepare(`SELECT COUNT(*) as c FROM chat_prefs WHERE account_id = ? AND is_pinned = 1`)
+      .get(req.account.id).c;
+    if (pinnedCount >= 5) return res.status(400).json({ error: 'Можно закрепить максимум 5 чатов' });
+  }
   db.prepare(
     `UPDATE chat_prefs SET is_pinned = ?, is_archived = ?, is_muted = ? WHERE chat_id = ? AND account_id = ?`
   ).run(
-    p.isPinned !== undefined ? (p.isPinned ? 1 : 0) : cur.is_pinned,
+    nextPinned,
     p.isArchived !== undefined ? (p.isArchived ? 1 : 0) : cur.is_archived,
     p.isMuted !== undefined ? (p.isMuted ? 1 : 0) : cur.is_muted,
     req.params.id,
@@ -602,6 +682,57 @@ app.patch('/chats/:id/prefs', auth, (req, res) => {
   );
   res.json({ ok: true });
 });
+
+app.post('/chats/:id/leave', auth, (req, res) => {
+  const chatId = req.params.id;
+  const member = db
+    .prepare(`SELECT id FROM chat_members WHERE chat_id = ? AND account_id = ?`)
+    .get(chatId, req.account.id);
+  if (!member) return res.status(404).json({ error: 'Не в чате' });
+  db.prepare(`DELETE FROM chat_members WHERE chat_id = ? AND account_id = ?`).run(chatId, req.account.id);
+  db.prepare(`DELETE FROM chat_prefs WHERE chat_id = ? AND account_id = ?`).run(chatId, req.account.id);
+  res.json({ ok: true });
+});
+
+app.post('/blocks', auth, (req, res) => {
+  const blockedId = String(req.body?.accountId || '');
+  if (!blockedId || blockedId === req.account.id) return res.status(400).json({ error: 'Неверный пользователь' });
+  const t = now();
+  try {
+    db.prepare(`INSERT INTO blocks (id, blocker_id, blocked_id, created_at) VALUES (?, ?, ?, ?)`).run(
+      uuid(),
+      req.account.id,
+      blockedId,
+      t
+    );
+  } catch {
+    /* already blocked */
+  }
+  res.json({ ok: true });
+});
+
+app.delete('/blocks/:id', auth, (req, res) => {
+  db.prepare(`DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?`).run(req.account.id, req.params.id);
+  res.json({ ok: true });
+});
+
+app.get('/blocks', auth, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT b.blocked_id as id, a.username, a.display_name as displayName, a.avatar_url as avatarPath
+       FROM blocks b INNER JOIN accounts a ON a.id = b.blocked_id WHERE b.blocker_id = ?`
+    )
+    .all(req.account.id);
+  res.json(rows);
+});
+
+function isBlockedEither(a, b) {
+  return !!db
+    .prepare(
+      `SELECT id FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1`
+    )
+    .get(a, b, b, a);
+}
 
 app.get('/chats/:id/messages', auth, (req, res) => {
   const member = db
@@ -662,6 +793,15 @@ app.post('/chats/:id/messages', auth, (req, res) => {
     .prepare(`SELECT id FROM chat_members WHERE chat_id = ? AND account_id = ?`)
     .get(req.params.id, req.account.id);
   if (!member) return res.status(403).json({ error: 'Access denied' });
+  const chatRow = db.prepare(`SELECT type FROM chats WHERE id = ?`).get(req.params.id);
+  if (chatRow?.type === 'private') {
+    const peer = db
+      .prepare(`SELECT account_id FROM chat_members WHERE chat_id = ? AND account_id != ? LIMIT 1`)
+      .get(req.params.id, req.account.id);
+    if (peer && isBlockedEither(req.account.id, peer.account_id)) {
+      return res.status(403).json({ error: 'Нельзя писать: пользователь в чёрном списке' });
+    }
+  }
   const type = req.body.type || 'text';
   const content = String(req.body.content || '').trim();
   if (type === 'text' && !content && !req.body.mediaPath) return res.status(400).json({ error: 'Пустое сообщение' });
@@ -753,6 +893,133 @@ app.patch('/messages/:id', auth, (req, res) => {
     req.params.id
   );
   res.json({ ok: true });
+});
+
+app.post('/calls/start', auth, (req, res) => {
+  try {
+    const peerId = String(req.body?.peerId || '');
+    const chatId = String(req.body?.chatId || '');
+    const mode = req.body?.mode === 'video' ? 'video' : 'audio';
+    const offer = String(req.body?.offerSdp || '');
+    if (!peerId || !chatId || !offer) return res.status(400).json({ error: 'Нужны peerId, chatId, offerSdp' });
+    if (isBlockedEither(req.account.id, peerId)) return res.status(403).json({ error: 'Пользователь в чёрном списке' });
+    db.prepare(`UPDATE calls SET status = 'ended', updated_at = ? WHERE caller_id = ? AND status IN ('ringing','active')`).run(
+      now(),
+      req.account.id
+    );
+    const id = uuid();
+    const t = now();
+    db.prepare(
+      `INSERT INTO calls (id, chat_id, caller_id, callee_id, mode, status, offer_sdp, answer_sdp, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'ringing', ?, NULL, ?, ?)`
+    ).run(id, chatId, req.account.id, peerId, mode, offer, t, t);
+    res.json({ id, status: 'ringing', mode, chatId, peerId });
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.get('/calls/incoming', auth, (req, res) => {
+  const row = db
+    .prepare(
+      `SELECT c.*, a.display_name as callerName, a.avatar_url as callerAvatar, a.username as callerUsername
+       FROM calls c INNER JOIN accounts a ON a.id = c.caller_id
+       WHERE c.callee_id = ? AND c.status = 'ringing' ORDER BY c.created_at DESC LIMIT 1`
+    )
+    .get(req.account.id);
+  if (!row) return res.json(null);
+  res.json({
+    id: row.id,
+    chatId: row.chat_id,
+    mode: row.mode,
+    status: row.status,
+    offerSdp: row.offer_sdp,
+    callerId: row.caller_id,
+    callerName: row.callerName,
+    callerAvatar: row.callerAvatar,
+    callerUsername: isHiddenUsername(row.callerUsername) ? '' : row.callerUsername,
+    createdAt: row.created_at,
+  });
+});
+
+app.get('/calls/:id', auth, (req, res) => {
+  const row = db.prepare(`SELECT * FROM calls WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.caller_id !== req.account.id && row.callee_id !== req.account.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  res.json({
+    id: row.id,
+    chatId: row.chat_id,
+    mode: row.mode,
+    status: row.status,
+    offerSdp: row.offer_sdp,
+    answerSdp: row.answer_sdp,
+    callerId: row.caller_id,
+    calleeId: row.callee_id,
+    updatedAt: row.updated_at,
+  });
+});
+
+app.post('/calls/:id/answer', auth, (req, res) => {
+  const row = db.prepare(`SELECT * FROM calls WHERE id = ?`).get(req.params.id);
+  if (!row || row.callee_id !== req.account.id) return res.status(404).json({ error: 'Not found' });
+  if (row.status !== 'ringing') return res.status(400).json({ error: 'Звонок уже не активен' });
+  const answer = String(req.body?.answerSdp || '');
+  if (!answer) return res.status(400).json({ error: 'Нужен answerSdp' });
+  db.prepare(`UPDATE calls SET status = 'active', answer_sdp = ?, updated_at = ? WHERE id = ?`).run(answer, now(), row.id);
+  res.json({ ok: true, status: 'active' });
+});
+
+app.post('/calls/:id/reject', auth, (req, res) => {
+  const row = db.prepare(`SELECT * FROM calls WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.caller_id !== req.account.id && row.callee_id !== req.account.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  db.prepare(`UPDATE calls SET status = 'rejected', updated_at = ? WHERE id = ?`).run(now(), row.id);
+  res.json({ ok: true });
+});
+
+app.post('/calls/:id/hangup', auth, (req, res) => {
+  const row = db.prepare(`SELECT * FROM calls WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.caller_id !== req.account.id && row.callee_id !== req.account.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  db.prepare(`UPDATE calls SET status = 'ended', updated_at = ? WHERE id = ?`).run(now(), row.id);
+  res.json({ ok: true });
+});
+
+app.post('/calls/:id/signal', auth, (req, res) => {
+  const row = db.prepare(`SELECT * FROM calls WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.caller_id !== req.account.id && row.callee_id !== req.account.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const kind = String(req.body?.kind || 'ice');
+  const payload = JSON.stringify(req.body?.payload ?? {});
+  db.prepare(
+    `INSERT INTO call_signals (id, call_id, from_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(uuid(), row.id, req.account.id, kind, payload, now());
+  res.json({ ok: true });
+});
+
+app.get('/calls/:id/signals', auth, (req, res) => {
+  const row = db.prepare(`SELECT * FROM calls WHERE id = ?`).get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.caller_id !== req.account.id && row.callee_id !== req.account.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const after = Number(req.query.after || 0);
+  const rows = db
+    .prepare(
+      `SELECT id, from_id as fromId, kind, payload, created_at as createdAt FROM call_signals
+       WHERE call_id = ? AND from_id != ? AND created_at > ? ORDER BY created_at ASC LIMIT 100`
+    )
+    .all(row.id, req.account.id, after)
+    .map((r) => ({ ...r, payload: JSON.parse(r.payload) }));
+  res.json(rows);
 });
 
 const port = Number(process.env.PORT || 8788);
