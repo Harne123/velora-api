@@ -10,12 +10,16 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
-const dataDir = path.join(root, 'data');
+// Render Persistent Disk обычно монтируют в /var/data — иначе data/ (на Free стирается при redeploy/сне)
+const dataDir =
+  process.env.DATA_DIR ||
+  (fs.existsSync('/var/data') ? '/var/data' : path.join(root, 'data'));
 fs.mkdirSync(dataDir, { recursive: true });
 
 const db = new Database(path.join(dataDir, 'velora-online.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+console.log('[velora] sqlite:', path.join(dataDir, 'velora-online.db'));
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS accounts (
@@ -320,7 +324,15 @@ function ensureSaved(accountId) {
   ).run(uuid(), chatId, accountId);
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'velora-online', version: '1.4.0' }));
+app.get('/health', (_req, res) =>
+  res.json({
+    ok: true,
+    service: 'velora-online',
+    version: '1.5.1',
+    dataDir,
+    durableHint: dataDir.startsWith('/var/data') || !!process.env.DATA_DIR,
+  })
+);
 
 app.post('/auth/request-code', async (req, res) => {
   try {
@@ -684,13 +696,26 @@ app.post('/chats/private', auth, (req, res) => {
     .get(req.account.id, peerId);
   if (existing) {
     const chat = db.prepare(`SELECT * FROM chats WHERE id = ?`).get(existing.id);
+    const mappedPeer = mapAccount(peer, req.account.id);
+    const t = chat.last_message_at || now();
     return res.json({
       id: chat.id,
-      type: chat.type,
-      title: peer.display_name,
-      username: peer.username,
-      avatarPath: peer.avatar_url,
+      type: 'private',
+      title: mappedPeer.displayName,
+      username: mappedPeer.username || null,
+      avatarPath: mappedPeer.avatarPath,
       unreadCount: 0,
+      lastMessageAt: t,
+      isPinned: 0,
+      isArchived: 0,
+      isMuted: 0,
+      folderId: null,
+      peerId: peer.id,
+      peerPresence: mappedPeer.presence,
+      peerLastSeen: mappedPeer.lastSeen,
+      isDeveloper: !!mappedPeer.isDeveloper,
+      createdAt: chat.created_at,
+      updatedAt: chat.updated_at,
     });
   }
 
@@ -711,13 +736,25 @@ app.post('/chats/private', auth, (req, res) => {
       `INSERT INTO chat_prefs (id, chat_id, account_id, is_pinned, is_archived, is_muted, unread_count) VALUES (?, ?, ?, 0, 0, 0, 0)`
     ).run(uuid(), chatId, uid);
   }
+  const mappedPeer = mapAccount(peer, req.account.id);
   res.json({
     id: chatId,
     type: 'private',
-    title: peer.display_name,
-    username: peer.username,
-    avatarPath: peer.avatar_url,
+    title: mappedPeer.displayName,
+    username: mappedPeer.username || null,
+    avatarPath: mappedPeer.avatarPath,
     unreadCount: 0,
+    lastMessageAt: t,
+    isPinned: 0,
+    isArchived: 0,
+    isMuted: 0,
+    folderId: null,
+    peerId: peer.id,
+    peerPresence: mappedPeer.presence,
+    peerLastSeen: mappedPeer.lastSeen,
+    isDeveloper: !!mappedPeer.isDeveloper,
+    createdAt: t,
+    updatedAt: t,
   });
 });
 
@@ -808,6 +845,122 @@ app.post('/chats/:id/leave', auth, (req, res) => {
   if (!member) return res.status(404).json({ error: 'Не в чате' });
   db.prepare(`DELETE FROM chat_members WHERE chat_id = ? AND account_id = ?`).run(chatId, req.account.id);
   db.prepare(`DELETE FROM chat_prefs WHERE chat_id = ? AND account_id = ?`).run(chatId, req.account.id);
+  res.json({ ok: true });
+});
+
+try {
+  db.exec(`ALTER TABLE chats ADD COLUMN only_admins_write INTEGER NOT NULL DEFAULT 0`);
+} catch { /* exists */ }
+
+app.get('/chats/:id/info', auth, (req, res) => {
+  const chatId = req.params.id;
+  const me = db
+    .prepare(`SELECT role FROM chat_members WHERE chat_id = ? AND account_id = ?`)
+    .get(chatId, req.account.id);
+  if (!me) return res.status(403).json({ error: 'Access denied' });
+  const chat = db.prepare(`SELECT * FROM chats WHERE id = ?`).get(chatId);
+  if (!chat) return res.status(404).json({ error: 'Not found' });
+  const members = db
+    .prepare(
+      `SELECT a.id, a.username, a.display_name as displayName, a.avatar_url as avatarPath,
+              a.presence, a.last_seen as lastSeen, cm.role
+       FROM chat_members cm INNER JOIN accounts a ON a.id = cm.account_id
+       WHERE cm.chat_id = ?
+       ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, a.display_name`
+    )
+    .all(chatId)
+    .map((m) => ({
+      ...m,
+      username: isHiddenUsername(m.username) ? '' : m.username,
+      presence: effectivePresence(m.presence, m.lastSeen),
+      avatarPath: m.avatarPath || null,
+    }));
+  const photos = db
+    .prepare(`SELECT COUNT(*) as c FROM messages WHERE chat_id = ? AND is_deleted = 0 AND type IN ('image','gif')`)
+    .get(chatId).c;
+  const videos = db
+    .prepare(`SELECT COUNT(*) as c FROM messages WHERE chat_id = ? AND is_deleted = 0 AND type = 'video'`)
+    .get(chatId).c;
+  const voices = db
+    .prepare(`SELECT COUNT(*) as c FROM messages WHERE chat_id = ? AND is_deleted = 0 AND type = 'voice'`)
+    .get(chatId).c;
+  res.json({
+    id: chat.id,
+    type: chat.type,
+    title: chat.title,
+    username: chat.username,
+    avatarPath: chat.avatar_url,
+    description: chat.description || '',
+    ownerId: chat.owner_id,
+    onlyAdminsWrite: !!chat.only_admins_write,
+    myRole: me.role,
+    members,
+    media: { photos, videos, voices },
+  });
+});
+
+app.patch('/chats/:id', auth, (req, res) => {
+  const chatId = req.params.id;
+  const me = db
+    .prepare(`SELECT role FROM chat_members WHERE chat_id = ? AND account_id = ?`)
+    .get(chatId, req.account.id);
+  if (!me || (me.role !== 'owner' && me.role !== 'admin')) {
+    return res.status(403).json({ error: 'Только владелец или админ' });
+  }
+  const chat = db.prepare(`SELECT * FROM chats WHERE id = ?`).get(chatId);
+  if (!chat) return res.status(404).json({ error: 'Not found' });
+  const p = req.body || {};
+  const title = p.title !== undefined ? String(p.title).trim() : chat.title;
+  if (!title) return res.status(400).json({ error: 'Название обязательно' });
+  const description = p.description !== undefined ? String(p.description) : chat.description;
+  const onlyAdmins =
+    p.onlyAdminsWrite !== undefined ? (p.onlyAdminsWrite ? 1 : 0) : chat.only_admins_write || 0;
+  const avatar = p.avatarPath !== undefined ? p.avatarPath : chat.avatar_url;
+  db.prepare(
+    `UPDATE chats SET title = ?, description = ?, avatar_url = ?, only_admins_write = ?, updated_at = ? WHERE id = ?`
+  ).run(title, description || '', avatar, onlyAdmins, now(), chatId);
+  res.json({ ok: true });
+});
+
+app.post('/chats/:id/members', auth, (req, res) => {
+  const chatId = req.params.id;
+  const me = db
+    .prepare(`SELECT role FROM chat_members WHERE chat_id = ? AND account_id = ?`)
+    .get(chatId, req.account.id);
+  if (!me || (me.role !== 'owner' && me.role !== 'admin')) {
+    return res.status(403).json({ error: 'Только владелец или админ' });
+  }
+  const ids = Array.isArray(req.body?.memberIds) ? req.body.memberIds.map(String) : [];
+  const t = now();
+  for (const uid of ids) {
+    if (!uid || uid === req.account.id) continue;
+    try {
+      db.prepare(`INSERT INTO chat_members (id, chat_id, account_id, role, joined_at) VALUES (?, ?, ?, 'member', ?)`).run(
+        uuid(),
+        chatId,
+        uid,
+        t
+      );
+      db.prepare(
+        `INSERT INTO chat_prefs (id, chat_id, account_id, is_pinned, is_archived, is_muted, unread_count) VALUES (?, ?, ?, 0, 0, 0, 0)`
+      ).run(uuid(), chatId, uid);
+    } catch {
+      /* already */
+    }
+  }
+  res.json({ ok: true });
+});
+
+app.post('/chats/:id/role', auth, (req, res) => {
+  const chatId = req.params.id;
+  const me = db
+    .prepare(`SELECT role FROM chat_members WHERE chat_id = ? AND account_id = ?`)
+    .get(chatId, req.account.id);
+  if (!me || me.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
+  const peerId = String(req.body?.accountId || '');
+  const role = req.body?.role === 'admin' ? 'admin' : 'member';
+  if (!peerId || peerId === req.account.id) return res.status(400).json({ error: 'Неверный пользователь' });
+  db.prepare(`UPDATE chat_members SET role = ? WHERE chat_id = ? AND account_id = ?`).run(role, chatId, peerId);
   res.json({ ok: true });
 });
 
@@ -912,10 +1065,13 @@ app.get('/chats/:id/messages', auth, (req, res) => {
 
 app.post('/chats/:id/messages', auth, (req, res) => {
   const member = db
-    .prepare(`SELECT id FROM chat_members WHERE chat_id = ? AND account_id = ?`)
+    .prepare(`SELECT role FROM chat_members WHERE chat_id = ? AND account_id = ?`)
     .get(req.params.id, req.account.id);
   if (!member) return res.status(403).json({ error: 'Access denied' });
-  const chatRow = db.prepare(`SELECT type FROM chats WHERE id = ?`).get(req.params.id);
+  const chatRow = db.prepare(`SELECT type, only_admins_write FROM chats WHERE id = ?`).get(req.params.id);
+  if (chatRow?.only_admins_write && member.role !== 'owner' && member.role !== 'admin') {
+    return res.status(403).json({ error: 'Писать могут только админы' });
+  }
   if (chatRow?.type === 'private') {
     const peer = db
       .prepare(`SELECT account_id FROM chat_members WHERE chat_id = ? AND account_id != ? LIMIT 1`)
